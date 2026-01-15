@@ -60,3 +60,18 @@ Tests are in `test/test_eval.jl` covering:
 ## Entry Point
 
 `bin/julia-eval-server` is the executable script that loads the module and calls `start_server()`. It accepts `JULIA_EVAL_PROJECT` environment variable to activate a specific project.
+
+## Using the MCP Tools
+
+**Important**: When using `julia_eval`, always display the code in a readable format in your message BEFORE calling the tool. The MCP permission prompt shows code as an escaped string which is unreadable. By showing the code first, users can verify what will be executed before approving.
+
+Example:
+```
+Running this Julia code:
+```julia
+x = 1 + 1
+println("Hello!")
+```
+
+[then call julia_eval]
+```
