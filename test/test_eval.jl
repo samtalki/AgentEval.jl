@@ -1,0 +1,93 @@
+@testset "Code Evaluation" begin
+    @testset "Basic arithmetic" begin
+        value, output, err = AgentEval.capture_eval("1 + 1")
+        @test err === nothing
+        @test value == 2
+    end
+
+    @testset "Variable assignment" begin
+        value, output, err = AgentEval.capture_eval("test_var_123 = 42")
+        @test err === nothing
+        @test value == 42
+
+        # Variable should persist in Main
+        @test Main.test_var_123 == 42
+    end
+
+    @testset "Multi-line code" begin
+        code = """
+        function test_multiline_func(x)
+            x * 2
+        end
+        test_multiline_func(21)
+        """
+        value, output, err = AgentEval.capture_eval(code)
+        @test err === nothing
+        @test value == 42
+
+        # Function should persist
+        @test Main.test_multiline_func(10) == 20
+    end
+
+    @testset "Output capture" begin
+        value, output, err = AgentEval.capture_eval("println(\"Hello, test!\")")
+        @test err === nothing
+        @test contains(output, "Hello, test!")
+    end
+
+    @testset "Error handling" begin
+        value, output, err = AgentEval.capture_eval("undefined_variable_xyz_abc")
+        @test err !== nothing
+        # Error can be LoadError wrapping UndefVarError
+        @test err isa Union{UndefVarError, LoadError}
+    end
+
+    @testset "Syntax error" begin
+        value, output, err = AgentEval.capture_eval("1 +")
+        @test err !== nothing
+    end
+end
+
+@testset "Result Formatting" begin
+    @testset "Success with value" begin
+        result = AgentEval.format_result(42, "", nothing)
+        @test contains(result, "Result: 42")
+    end
+
+    @testset "Success with output" begin
+        result = AgentEval.format_result(nothing, "Hello!", nothing)
+        @test contains(result, "Output:")
+        @test contains(result, "Hello!")
+    end
+
+    @testset "Error formatting" begin
+        err = ErrorException("Test error")
+        result = AgentEval.format_result(nothing, "", err)
+        @test contains(result, "Error:")
+        @test contains(result, "Test error")
+    end
+end
+
+@testset "User Symbols" begin
+    # Create a test variable via capture_eval (which uses include_string)
+    AgentEval.capture_eval("test_user_symbol_789 = 123")
+
+    symbols = AgentEval.get_user_symbols()
+
+    # Should include our test variable
+    @test :test_user_symbol_789 in symbols
+
+    # Should not include protected symbols
+    @test :Base ∉ symbols
+    @test :Core ∉ symbols
+    @test :Main ∉ symbols
+end
+
+@testset "Protected Symbols" begin
+    # These should all be in the protected set
+    @test :Base in AgentEval.PROTECTED_SYMBOLS
+    @test :Core in AgentEval.PROTECTED_SYMBOLS
+    @test :Main in AgentEval.PROTECTED_SYMBOLS
+    @test :eval in AgentEval.PROTECTED_SYMBOLS
+    @test :include in AgentEval.PROTECTED_SYMBOLS
+end
