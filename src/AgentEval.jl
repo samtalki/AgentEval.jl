@@ -8,6 +8,14 @@ Unlike HTTP-based alternatives (MCPRepl.jl), AgentEval uses STDIO transport whic
 - Auto-spawns when MCP client needs it (no manual startup)
 - Can be registered in Julia General registry
 
+# Architecture
+
+AgentEval uses a worker subprocess model:
+- The MCP server runs in the main process
+- Code evaluation happens in a spawned worker process (via Distributed.jl)
+- `julia_reset` kills the worker and spawns a fresh one (true reset)
+- `julia_activate` switches the worker's active project/environment
+
 # Quick Start
 
 ```julia
@@ -18,15 +26,16 @@ AgentEval.start_server()  # Blocks, waiting for MCP client
 # Claude Code Configuration
 
 ```bash
-claude mcp add julia-eval -- julia --project=/path/to/AgentEval.jl -e "using AgentEval; AgentEval.start_server()"
+claude mcp add julia-eval -- julia --project=/path/to/AgentEval.jl /path/to/AgentEval.jl/bin/julia-eval-server
 ```
 
 # Tools Provided
 
 - `julia_eval` - Evaluate Julia code with persistent state
-- `julia_reset` - Soft reset (clear variables, cannot redefine types)
+- `julia_reset` - Hard reset (kills worker, spawns fresh one)
 - `julia_info` - Get session info (Julia version, loaded packages, variables)
 - `julia_pkg` - Manage packages (add, rm, status, update, instantiate, resolve)
+- `julia_activate` - Switch active project/environment
 
 # See Also
 
@@ -36,127 +45,293 @@ claude mcp add julia-eval -- julia --project=/path/to/AgentEval.jl -e "using Age
 module AgentEval
 
 using ModelContextProtocol
+using Distributed
 using Pkg
 
 export start_server
 
-# Symbols to exclude from reset (Julia internals)
-const PROTECTED_SYMBOLS = Set([
-    :Base, :Core, :Main, :ans, :include, :eval,
-    :AgentEval, :ModelContextProtocol, :Pkg
-])
+# Worker management
+mutable struct WorkerState
+    worker_id::Union{Int, Nothing}
+    project_path::Union{String, Nothing}
+end
+
+const WORKER = WorkerState(nothing, nothing)
 
 """
-    capture_eval(code::String) -> (value, output, error, backtrace)
+    ensure_worker!() -> Int
 
-Evaluate Julia code and capture both the return value and any printed output.
-Returns a tuple of (value, stdout_output, error_or_nothing, backtrace_or_nothing).
+Ensure a worker process exists, creating one if needed. Returns the worker ID.
 """
-function capture_eval(code::String)
-    value = nothing
-    err = nothing
-    bt = nothing
+function ensure_worker!()
+    if WORKER.worker_id === nothing || !(WORKER.worker_id in workers())
+        # Spawn a new worker
+        new_workers = addprocs(1)
+        WORKER.worker_id = first(new_workers)
 
-    old_stdout = stdout
-    old_stderr = stderr
+        # Load Pkg on the worker for environment management
+        @everywhere WORKER.worker_id using Pkg
 
-    rd_out, wr_out = redirect_stdout()
-    rd_err, wr_err = redirect_stderr()
-
-    try
-        # Evaluate in Main module so definitions persist
-        value = include_string(Main, code, "AgentEval[REPL]")
-    catch e
-        err = e
-        bt = catch_backtrace()
-    finally
-        # Restore stdout/stderr
-        redirect_stdout(old_stdout)
-        redirect_stderr(old_stderr)
-        close(wr_out)
-        close(wr_err)
+        # Activate project if one was set
+        if WORKER.project_path !== nothing
+            try
+                remotecall_fetch(WORKER.worker_id, WORKER.project_path) do path
+                    Pkg.activate(path)
+                end
+            catch e
+                @warn "Failed to activate project on worker" project=WORKER.project_path error=e
+            end
+        end
     end
-
-    # Read captured output, ensuring pipes are closed even on read failure
-    stdout_content = ""
-    stderr_content = ""
-    try
-        stdout_content = String(read(rd_out))
-        stderr_content = String(read(rd_err))
-    finally
-        close(rd_out)
-        close(rd_err)
-    end
-
-    combined_output = stdout_content
-    if !isempty(stderr_content)
-        combined_output *= "\n[stderr]\n" * stderr_content
-    end
-
-    return (value, combined_output, err, bt)
+    return WORKER.worker_id
 end
 
 """
-    format_result(code::String, value, output::String, err, bt=nothing) -> String
+    kill_worker!()
+
+Kill the current worker process if one exists.
+"""
+function kill_worker!()
+    if WORKER.worker_id !== nothing && WORKER.worker_id in workers()
+        rmprocs(WORKER.worker_id)
+    end
+    WORKER.worker_id = nothing
+end
+
+"""
+    reset_worker!()
+
+Kill the current worker and spawn a fresh one. Returns the new worker ID.
+"""
+function reset_worker!()
+    kill_worker!()
+    return ensure_worker!()
+end
+
+"""
+    capture_eval_on_worker(code::String) -> (value, output, error, backtrace)
+
+Evaluate Julia code on the worker process, capturing both return value and printed output.
+"""
+function capture_eval_on_worker(code::String)
+    worker_id = ensure_worker!()
+
+    # Run evaluation on worker with output capture
+    result = remotecall_fetch(worker_id, code) do code_str
+        value = nothing
+        err = nothing
+        bt = nothing
+
+        old_stdout = stdout
+        old_stderr = stderr
+
+        rd_out, wr_out = redirect_stdout()
+        rd_err, wr_err = redirect_stderr()
+
+        try
+            # Evaluate in Main module so definitions persist
+            value = include_string(Main, code_str, "AgentEval[REPL]")
+        catch e
+            err = e
+            bt = catch_backtrace()
+        finally
+            redirect_stdout(old_stdout)
+            redirect_stderr(old_stderr)
+            close(wr_out)
+            close(wr_err)
+        end
+
+        # Read captured output
+        stdout_content = ""
+        stderr_content = ""
+        try
+            stdout_content = String(read(rd_out))
+            stderr_content = String(read(rd_err))
+        finally
+            close(rd_out)
+            close(rd_err)
+        end
+
+        combined_output = stdout_content
+        if !isempty(stderr_content)
+            combined_output *= "\n[stderr]\n" * stderr_content
+        end
+
+        # Return serializable results (convert error to string if needed)
+        error_str = err === nothing ? nothing : sprint(showerror, err, bt)
+        value_str = try
+            repr(value)
+        catch
+            string(value)
+        end
+
+        return (value_str, combined_output, error_str)
+    end
+
+    return result
+end
+
+"""
+    format_result(code::String, value_str::String, output::String, error_str::Union{String,Nothing}) -> String
 
 Format the evaluation result for display to the user.
-Always shows the executed code so users can verify what ran.
+Shows result first for better visibility in collapsed view, then output, then code.
 """
-function format_result(code::String, value, output::String, err, bt=nothing)
+function format_result(code::String, value_str::String, output::String, error_str::Union{String,Nothing})
     result_parts = String[]
 
-    # Always show the code that was executed
-    push!(result_parts, "Code:\n```julia\n$(strip(code))\n```")
+    # Show error or result FIRST for visibility in collapsed output
+    if error_str !== nothing
+        push!(result_parts, "Error: $error_str")
+    else
+        push!(result_parts, "Result: $value_str")
+    end
 
-    # Include output even if there's an error (code may have printed before failing)
+    # Include printed output (may exist even if there's an error)
     if !isempty(strip(output))
         push!(result_parts, "Output:\n$output")
     end
 
-    if err !== nothing
-        error_msg = if bt !== nothing
-            sprint(showerror, err, bt)
-        else
-            sprint(showerror, err)
-        end
-        push!(result_parts, "Error:\n$error_msg")
-        return join(result_parts, "\n\n")
-    end
-
-    # Format the return value
-    value_str = try
-        repr(value)
-    catch
-        string(value)
-    end
-    push!(result_parts, "Result: $value_str")
+    # Show code last (user already saw it before approving)
+    push!(result_parts, "Code:\n```julia\n$(strip(code))\n```")
 
     return join(result_parts, "\n\n")
 end
 
 """
-    get_user_symbols() -> Vector{Symbol}
+    get_worker_info() -> NamedTuple
 
-Get all user-defined symbols in Main module (excluding Julia internals).
+Get information about the current worker session.
 """
-function get_user_symbols()
-    all_names = names(Main; all=true)
-    user_symbols = Symbol[]
+function get_worker_info()
+    worker_id = ensure_worker!()
 
-    for name in all_names
-        name_str = string(name)
-        # Skip internal symbols (start with # or _)
-        if startswith(name_str, "#") || startswith(name_str, "_")
-            continue
+    info = remotecall_fetch(worker_id) do
+        # Get user-defined symbols
+        all_names = names(Main; all=true)
+        protected = Set([:Base, :Core, :Main, :ans, :include, :eval, :Pkg])
+        user_vars = Symbol[]
+        for name in all_names
+            name_str = string(name)
+            if !startswith(name_str, "#") && !startswith(name_str, "_") && !(name in protected)
+                push!(user_vars, name)
+            end
         end
-        # Skip protected symbols
-        if name in PROTECTED_SYMBOLS
-            continue
+
+        # Get project path
+        project_path = try
+            dirname(Pkg.project().path)
+        catch
+            "(no project)"
         end
-        push!(user_symbols, name)
+
+        # Get loaded modules count
+        loaded_count = try
+            length(keys(Base.loaded_modules))
+        catch
+            0
+        end
+
+        return (
+            version = string(VERSION),
+            project = project_path,
+            variables = user_vars,
+            modules = loaded_count
+        )
     end
 
-    return user_symbols
+    return info
+end
+
+"""
+    activate_project_on_worker!(path::String)
+
+Activate a Julia project/environment on the worker.
+"""
+function activate_project_on_worker!(path::String)
+    worker_id = ensure_worker!()
+
+    result = remotecall_fetch(worker_id, path) do p
+        try
+            if p == "@." || p == "."
+                # Activate current directory
+                Pkg.activate(".")
+            elseif startswith(p, "@")
+                # Named environment (e.g., @v1.10)
+                Pkg.activate(p)
+            else
+                # Path to project
+                Pkg.activate(p)
+            end
+            return (success = true, project = dirname(Pkg.project().path))
+        catch e
+            return (success = false, error = sprint(showerror, e))
+        end
+    end
+
+    if result.success
+        WORKER.project_path = result.project
+    end
+
+    return result
+end
+
+"""
+    run_pkg_action_on_worker(action::String, pkg_list::Vector{String})
+
+Run a Pkg action on the worker process.
+"""
+function run_pkg_action_on_worker(action::String, pkg_list::Vector{String})
+    worker_id = ensure_worker!()
+
+    result = remotecall_fetch(worker_id, action, pkg_list) do act, pkgs
+        old_stdout = stdout
+        old_stderr = stderr
+        rd_out, wr_out = redirect_stdout()
+        rd_err, wr_err = redirect_stderr()
+
+        err = nothing
+        try
+            if act == "add"
+                Pkg.add(pkgs)
+            elseif act == "rm"
+                Pkg.rm(pkgs)
+            elseif act == "status"
+                Pkg.status()
+            elseif act == "update"
+                if isempty(pkgs)
+                    Pkg.update()
+                else
+                    Pkg.update(pkgs)
+                end
+            elseif act == "instantiate"
+                Pkg.instantiate()
+            elseif act == "resolve"
+                Pkg.resolve()
+            end
+        catch e
+            err = sprint(showerror, e, catch_backtrace())
+        finally
+            redirect_stdout(old_stdout)
+            redirect_stderr(old_stderr)
+            close(wr_out)
+            close(wr_err)
+        end
+
+        stdout_content = ""
+        stderr_content = ""
+        try
+            stdout_content = String(read(rd_out))
+            stderr_content = String(read(rd_err))
+        finally
+            close(rd_out)
+            close(rd_err)
+        end
+
+        return (error = err, stdout = stdout_content, stderr = stderr_content)
+    end
+
+    return result
 end
 
 """
@@ -165,12 +340,14 @@ end
 Start the AgentEval MCP server using STDIO transport.
 
 # Arguments
-- `project_dir`: Optional path to a Julia project to activate before starting.
+- `project_dir`: Optional path to a Julia project to activate on the worker.
 
 # Tools Provided
 - `julia_eval`: Evaluate Julia code with persistent state
-- `julia_reset`: Soft reset (clear variables, cannot redefine types)
+- `julia_reset`: Hard reset (kills worker, spawns fresh one)
 - `julia_info`: Get session information
+- `julia_pkg`: Manage packages
+- `julia_activate`: Switch active project/environment
 
 # Example
 ```julia
@@ -179,19 +356,16 @@ AgentEval.start_server()  # Blocks, waiting for MCP client
 ```
 """
 function start_server(; project_dir::Union{String,Nothing}=nothing)
-    # Activate project if specified
+    # Set initial project path
     if project_dir !== nothing
         if !isdir(project_dir)
             error("Cannot activate project: directory '$project_dir' not found")
         end
-
-        try
-            Pkg.activate(project_dir)
-            @info "Activated project" project_dir
-        catch e
-            error("Cannot activate project at '$project_dir': $(sprint(showerror, e))")
-        end
+        WORKER.project_path = project_dir
     end
+
+    # Spawn initial worker
+    ensure_worker!()
 
     # Tool: Evaluate Julia code
     eval_tool = MCPTool(
@@ -218,7 +392,6 @@ Use this for iterative development, testing, and exploration.
         handler = params -> begin
             code = get(params, "code", nothing)
 
-            # Validate input
             if code === nothing || !isa(code, AbstractString)
                 return TextContent(text = "Error: 'code' parameter is required and must be a string")
             end
@@ -227,54 +400,40 @@ Use this for iterative development, testing, and exploration.
                 return TextContent(text = "Error: 'code' parameter cannot be empty")
             end
 
-            value, output, err, bt = capture_eval(code)
-            result = format_result(code, value, output, err, bt)
+            value_str, output, error_str = capture_eval_on_worker(code)
+            result = format_result(code, value_str, output, error_str)
             TextContent(text = result)
         end
     )
 
-    # Tool: Soft reset
+    # Tool: Hard reset (kill and respawn worker)
     reset_tool = MCPTool(
         name = "julia_reset",
         description = """
-Soft reset: Clear user-defined variables in the Main module.
+Hard reset: Kill the Julia worker process and spawn a fresh one.
 
-Note: This cannot redefine types or structs. If you need to redefine
-a type, the user must restart their Claude Code session (which will
-spawn a fresh Julia process).
+This provides a true reset:
+- All variables are cleared
+- All loaded packages are unloaded
+- Type definitions are cleared (unlike soft reset)
+- The worker starts completely fresh
 
-Use this when you want to start fresh without restarting Julia.
+Use this when you need a clean slate or to redefine types/structs.
 """,
         parameters = [],
         handler = _ -> begin
-            cleared = String[]
-            skipped = String[]
-            for name in Base.invokelatest(get_user_symbols)
-                try
-                    Core.eval(Main, :($(name) = nothing))
-                    push!(cleared, string(name))
-                catch e
-                    # Expected: const bindings and special variables can't be reassigned
-                    if e isa ErrorException && occursin("cannot assign", e.msg)
-                        push!(skipped, string(name))
-                    else
-                        # Unexpected error - include details
-                        push!(skipped, "$(name) ($(typeof(e).name.name))")
-                    end
-                end
-            end
+            old_id = WORKER.worker_id
+            new_id = reset_worker!()
 
-            msg = if isempty(cleared) && isempty(skipped)
-                "No user variables to clear."
-            elseif isempty(cleared)
-                "No variables cleared. Skipped $(length(skipped)) const/protected: $(join(skipped, ", "))"
-            else
-                result = "Cleared $(length(cleared)) variable(s): $(join(cleared, ", "))"
-                if !isempty(skipped)
-                    result *= "\nSkipped $(length(skipped)) const/protected: $(join(skipped, ", "))"
-                end
-                result *= "\n\nNote: Type redefinitions require restarting the Claude session."
-                result
+            msg = """
+Session reset complete.
+- Old worker (ID: $old_id) terminated
+- New worker (ID: $new_id) spawned
+- All variables, functions, and types cleared
+- Packages will need to be reloaded with `using`
+"""
+            if WORKER.project_path !== nothing
+                msg *= "- Project re-activated: $(WORKER.project_path)\n"
             end
 
             TextContent(text = msg)
@@ -291,30 +450,23 @@ Returns:
 - Julia version
 - Active project path
 - List of user-defined variables
-- Number of loaded packages
+- Number of loaded modules
+- Worker process ID
 """,
         parameters = [],
         handler = _ -> begin
-            user_vars = Base.invokelatest(get_user_symbols)
-            project_path = try
-                dirname(Pkg.project().path)
-            catch
-                "(no project)"
-            end
+            info = get_worker_info()
 
-            loaded_pkgs = try
-                length(keys(Base.loaded_modules))
-            catch
-                0
-            end
+            vars_str = isempty(info.variables) ? "(none)" : join(info.variables, ", ")
 
-            info = """
-Julia Version: $(VERSION)
-Active Project: $project_path
-User Variables: $(isempty(user_vars) ? "(none)" : join(user_vars, ", "))
-Loaded Modules: $loaded_pkgs
+            msg = """
+Julia Version: $(info.version)
+Active Project: $(info.project)
+User Variables: $vars_str
+Loaded Modules: $(info.modules)
+Worker ID: $(WORKER.worker_id)
 """
-            TextContent(text = info)
+            TextContent(text = msg)
         end
     )
 
@@ -358,7 +510,6 @@ Examples:
             )
         ],
         handler = params -> begin
-            # Extract and validate action
             action = get(params, "action", nothing)
             if action === nothing || !isa(action, AbstractString)
                 return TextContent(text = "Error: 'action' parameter is required and must be a string")
@@ -369,13 +520,11 @@ Examples:
                 return TextContent(text = "Error: action must be one of: add, rm, status, update, instantiate, resolve (got: '$action')")
             end
 
-            # Extract and parse packages parameter
             packages_str = get(params, "packages", "")
             if packages_str === nothing
                 packages_str = ""
             end
 
-            # Parse package list (split on comma and/or whitespace)
             pkg_list = String[]
             if !isempty(strip(packages_str))
                 for part in split(packages_str, r"[,\s]+")
@@ -386,102 +535,93 @@ Examples:
                 end
             end
 
-            # Validate packages for actions that require them
             if action_lower in ["add", "rm"] && isempty(pkg_list)
                 return TextContent(text = "Error: 'packages' parameter is required for action '$action_lower'")
             end
 
-            # Execute package operation with output capture
-            result_msg = ""
-            old_stdout = stdout
-            old_stderr = stderr
-            rd_out, wr_out = redirect_stdout()
-            rd_err, wr_err = redirect_stderr()
+            result = run_pkg_action_on_worker(action_lower, pkg_list)
 
-            err = nothing
-            bt = nothing
-            try
-                if action_lower == "add"
-                    Pkg.add(pkg_list)
-                elseif action_lower == "rm"
-                    Pkg.rm(pkg_list)
-                elseif action_lower == "status"
-                    Pkg.status()
-                elseif action_lower == "update"
-                    if isempty(pkg_list)
-                        Pkg.update()
-                    else
-                        Pkg.update(pkg_list)
-                    end
-                elseif action_lower == "instantiate"
-                    Pkg.instantiate()
-                elseif action_lower == "resolve"
-                    Pkg.resolve()
-                end
-            catch e
-                err = e
-                bt = catch_backtrace()
-            finally
-                redirect_stdout(old_stdout)
-                redirect_stderr(old_stderr)
-                close(wr_out)
-                close(wr_err)
+            if result.error !== nothing
+                return TextContent(text = "Error during Pkg.$action_lower:\n$(result.error)")
             end
 
-            # Read captured output
-            stdout_content = ""
-            stderr_content = ""
-            try
-                stdout_content = String(read(rd_out))
-                stderr_content = String(read(rd_err))
-            finally
-                close(rd_out)
-                close(rd_err)
+            action_summary = if action_lower == "add"
+                "Added $(length(pkg_list)) package(s): $(join(pkg_list, ", "))"
+            elseif action_lower == "rm"
+                "Removed $(length(pkg_list)) package(s): $(join(pkg_list, ", "))"
+            elseif action_lower == "status"
+                "Package Status:"
+            elseif action_lower == "update"
+                isempty(pkg_list) ? "Updated all packages" : "Updated $(length(pkg_list)) package(s): $(join(pkg_list, ", "))"
+            elseif action_lower == "instantiate"
+                "Instantiated environment (downloaded and precompiled dependencies)"
+            elseif action_lower == "resolve"
+                "Resolved dependencies (updated Manifest.toml)"
             end
 
-            # Format result
-            if err !== nothing
-                error_msg = bt !== nothing ? sprint(showerror, err, bt) : sprint(showerror, err)
-                result_msg = "Error during Pkg.$action_lower:\n$error_msg"
+            result_parts = [action_summary]
+            if !isempty(strip(result.stdout))
+                push!(result_parts, "\nOutput:\n$(result.stdout)")
+            end
+            if !isempty(strip(result.stderr))
+                push!(result_parts, "\n[stderr]\n$(result.stderr)")
+            end
+
+            TextContent(text = join(result_parts, ""))
+        end
+    )
+
+    # Tool: Activate project/environment
+    activate_tool = MCPTool(
+        name = "julia_activate",
+        description = """
+Activate a Julia project or environment.
+
+Supports:
+- Path to a project directory containing Project.toml
+- "." or "@." to activate the current directory
+- Named environments like "@v1.10" for shared environments
+
+Examples:
+- julia_activate(path=".")  # Current directory
+- julia_activate(path="/path/to/MyProject")
+- julia_activate(path="@v1.10")  # Shared environment
+
+After activation, use `julia_pkg(action="instantiate")` to install dependencies.
+""",
+        parameters = [
+            ToolParameter(
+                name = "path",
+                type = "string",
+                description = "Path to project directory, '.' for current directory, or named environment like '@v1.10'",
+                required = true
+            )
+        ],
+        handler = params -> begin
+            path = get(params, "path", nothing)
+            if path === nothing || !isa(path, AbstractString)
+                return TextContent(text = "Error: 'path' parameter is required and must be a string")
+            end
+
+            result = activate_project_on_worker!(path)
+
+            if result.success
+                TextContent(text = "Activated project: $(result.project)\n\nUse `julia_pkg(action=\"instantiate\")` to install dependencies if needed.")
             else
-                # Build success message
-                action_summary = if action_lower == "add"
-                    "Added $(length(pkg_list)) package(s): $(join(pkg_list, ", "))"
-                elseif action_lower == "rm"
-                    "Removed $(length(pkg_list)) package(s): $(join(pkg_list, ", "))"
-                elseif action_lower == "status"
-                    "Package Status:"
-                elseif action_lower == "update"
-                    isempty(pkg_list) ? "Updated all packages" : "Updated $(length(pkg_list)) package(s): $(join(pkg_list, ", "))"
-                elseif action_lower == "instantiate"
-                    "Instantiated environment (downloaded and precompiled dependencies)"
-                elseif action_lower == "resolve"
-                    "Resolved dependencies (updated Manifest.toml)"
-                end
-
-                result_parts = [action_summary]
-                if !isempty(strip(stdout_content))
-                    push!(result_parts, "\nOutput:\n$stdout_content")
-                end
-                if !isempty(strip(stderr_content))
-                    push!(result_parts, "\n[stderr]\n$stderr_content")
-                end
-                result_msg = join(result_parts, "")
+                TextContent(text = "Error activating project: $(result.error)")
             end
-
-            TextContent(text = result_msg)
         end
     )
 
     # Create and start the server
     server = mcp_server(
         name = "agent-eval",
-        version = "0.1.0",
+        version = "0.2.0",
         description = "Persistent Julia code evaluation for AI agents - eliminates TTFX",
-        tools = [eval_tool, reset_tool, info_tool, pkg_tool]
+        tools = [eval_tool, reset_tool, info_tool, pkg_tool, activate_tool]
     )
 
-    @info "AgentEval server starting..." julia_version=VERSION
+    @info "AgentEval server starting..." julia_version=VERSION worker_id=WORKER.worker_id
     start!(server)
 end
 
