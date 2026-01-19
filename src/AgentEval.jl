@@ -70,7 +70,9 @@ function ensure_worker!()
         WORKER.worker_id = first(new_workers)
 
         # Load Pkg on the worker for environment management
-        @everywhere WORKER.worker_id using Pkg
+        remotecall_fetch(WORKER.worker_id) do
+            @eval Main using Pkg
+        end
 
         # Activate project if one was set
         if WORKER.project_path !== nothing

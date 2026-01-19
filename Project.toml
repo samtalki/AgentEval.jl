@@ -1,15 +1,17 @@
 name = "AgentEval"
 uuid = "c6b0b931-bd15-49f6-a31f-cf7d80eb5e81"
-authors = ["Sam"]
 version = "0.1.0"
+authors = ["Sam"]
 
 [deps]
+Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 ModelContextProtocol = "c58f755f-f2a7-4f48-bf29-4e9659b78499"
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 
 [compat]
-julia = "1.10"
+Distributed = "1.11.0"
 ModelContextProtocol = "0.4"
+julia = "1.10"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
