@@ -59,6 +59,8 @@ Five tools registered via ModelContextProtocol.jl:
 ### Key Design Decisions
 
 - **Worker subprocess model**: Enables true hard reset with type redefinition
+- **Lazy worker spawning**: Worker is created on first tool use, not at server startup (avoids STDIO conflicts with MCP)
+- **Expression-based IPC**: Uses `remotecall_fetch(Core.eval, worker_id, Main, expr)` instead of closures to avoid serialization issues
 - **STDIO transport only**: No network ports for security
 - **Environment persistence**: Activated environment survives reset
 - **Result-first formatting**: Shows Result/Error first for better collapsed view UX
@@ -70,8 +72,7 @@ Tests are in `test/test_eval.jl` covering:
 - Output capture and error handling
 - Result formatting
 - Symbol management and protected symbol validation
-
-**Note**: Tests may need updating for the worker subprocess model.
+- Worker subprocess lifecycle (spawn, reset, persistence)
 
 ## Entry Point
 

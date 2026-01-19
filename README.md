@@ -13,6 +13,8 @@ Persistent Julia code evaluation for AI agents via MCP (Model Context Protocol).
 | Transport | **STDIO** | HTTP :3000 | TCP :8000+ |
 | Auto-start | **Yes** | No (manual) | No (manual) |
 | Network port | **None** | Yes | Yes |
+| True hard reset | **Yes** | No | No |
+| Type redefinition | **Yes** | No | No |
 | Registry eligible | **Yes** | No (security) | No |
 | Persistent | Yes | Yes | Yes |
 | Solves TTFX | Yes | Yes | Yes |
@@ -22,7 +24,8 @@ Persistent Julia code evaluation for AI agents via MCP (Model Context Protocol).
 - **STDIO Transport**: No network port opened, more secure, can be registered in Julia General
 - **Auto-spawns**: Claude Code starts AgentEval automatically when needed
 - **Persistent State**: Variables, functions, and loaded packages survive across calls
-- **Simple Setup**: One command to configure Claude Code
+- **True Hard Reset**: Worker subprocess model allows type redefinitions without restarting Claude Code
+- **Simple Setup**: One command to configure, or use the included plugin for zero-config
 
 ## Installation
 
@@ -39,19 +42,32 @@ Pkg.dev("https://github.com/samtalki/AgentEval.jl")
 
 ## Quick Start
 
-### 1. Configure Claude Code
+### Option A: Use the Plugin (Recommended)
+
+The easiest way to use AgentEval is via the included Claude Code plugin:
 
 ```bash
-claude mcp add julia-eval -- julia --project=/path/to/AgentEval.jl -e "using AgentEval; AgentEval.start_server()"
+claude --plugin-dir /path/to/AgentEval.jl/claude-plugin
+```
+
+This provides:
+- Auto-configured MCP server (no manual setup)
+- Slash commands: `/julia-reset`, `/julia-info`, `/julia-pkg`, `/julia-activate`
+- Best practices skill for Julia evaluation
+
+### Option B: Manual MCP Configuration
+
+```bash
+claude mcp add julia -- julia --project=/path/to/AgentEval.jl -e "using AgentEval; AgentEval.start_server()"
 ```
 
 Or using the provided script:
 
 ```bash
-claude mcp add julia-eval -- julia --project=/path/to/AgentEval.jl /path/to/AgentEval.jl/bin/julia-eval-server
+claude mcp add julia -- julia --project=/path/to/AgentEval.jl /path/to/AgentEval.jl/bin/julia-eval-server
 ```
 
-### 2. Use in Claude Code
+### Using AgentEval
 
 Start a new Claude Code session. The Julia MCP server will auto-start when Claude needs it.
 
@@ -59,6 +75,30 @@ Ask Claude to run Julia code:
 > "Calculate the first 10 Fibonacci numbers in Julia"
 
 Claude will use the `julia_eval` tool, and the result will appear instantly after the first call (which may take a few seconds for JIT compilation).
+
+## Architecture
+
+AgentEval uses a **worker subprocess model** via Distributed.jl:
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Claude Code                                          │
+│   ↕ STDIO (MCP)                                      │
+│ ┌─────────────────────────────────────────────────┐ │
+│ │ AgentEval MCP Server (Main Process)             │ │
+│ │   ↕ Distributed.jl                              │ │
+│ │ ┌─────────────────────────────────────────────┐ │ │
+│ │ │ Worker Process (code evaluation happens here)│ │ │
+│ │ └─────────────────────────────────────────────┘ │ │
+│ └─────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────┘
+```
+
+**Why a worker subprocess?**
+- `julia_reset` can kill and respawn the worker for a **true hard reset**
+- Type/struct redefinitions work (impossible with in-process reset)
+- The activated environment persists across resets
+- Worker is spawned lazily on first use to avoid STDIO conflicts
 
 ## Tools Provided
 
@@ -83,18 +123,24 @@ Features:
 
 ### `julia_reset`
 
-Soft reset: Clear user-defined variables.
+**Hard reset**: Kills the worker process and spawns a fresh one.
 
 ```
 julia_reset()
-# Clears all user variables, but cannot redefine types
+# Worker killed and respawned - complete clean slate
 ```
 
-Note: Type redefinitions require restarting the Claude Code session.
+This enables:
+- Clearing all variables
+- Unloading all packages
+- **Redefining types/structs** (impossible with soft resets)
+- Starting with a completely fresh Julia state
+
+The activated environment persists across resets.
 
 ### `julia_info`
 
-Get session information.
+Get session information including worker process ID.
 
 ```
 julia_info()
@@ -102,6 +148,27 @@ julia_info()
 # Active Project: /path/to/project
 # User Variables: x, y, my_function
 # Loaded Modules: 42
+# Worker ID: 2
+```
+
+### `julia_activate`
+
+Switch the active Julia project/environment.
+
+```
+# Activate current directory
+julia_activate(path=".")
+
+# Activate a specific project
+julia_activate(path="/path/to/MyProject")
+
+# Activate a named shared environment
+julia_activate(path="@v1.10")
+```
+
+After activation, install dependencies with:
+```
+julia_pkg(action="instantiate")
 ```
 
 ### `julia_pkg`
@@ -144,21 +211,45 @@ The `packages` parameter accepts space or comma-separated package names.
 
 ## Configuration
 
-### Activate a Specific Project
+### Environment/Project Management
 
-Set the `JULIA_EVAL_PROJECT` environment variable:
+There are three ways to set the Julia environment:
 
-```bash
-JULIA_EVAL_PROJECT=/path/to/your/project claude mcp add julia-eval -- julia --project=/path/to/AgentEval.jl -e "using AgentEval; AgentEval.start_server()"
+**1. At runtime (recommended)**: Use `julia_activate` to switch environments dynamically:
+```
+julia_activate(path="/path/to/your/project")
+julia_pkg(action="instantiate")
 ```
 
-Or pass it directly:
+**2. Via environment variable**: Set `JULIA_EVAL_PROJECT` before starting:
+```bash
+JULIA_EVAL_PROJECT=/path/to/your/project claude mcp add julia -- julia --project=/path/to/AgentEval.jl -e "using AgentEval; AgentEval.start_server()"
+```
 
+**3. In code**: Pass directly to the server:
 ```julia
 AgentEval.start_server(project_dir="/path/to/your/project")
 ```
 
+The activated environment persists across `julia_reset` calls.
+
 ## Comparison with Alternatives
+
+### vs Auton.jl
+
+[Auton.jl](https://github.com/AntonOresten/Auton.jl) provides LLM-augmented REPL modes for human-in-the-loop workflows.
+
+| Aspect | AgentEval | Auton.jl |
+|--------|-----------|----------|
+| Use case | AI agent automation | Human + LLM collaboration |
+| Operator | AI agent (autonomous) | Human at keyboard |
+| Interface | MCP tools (headless) | REPL modes (interactive) |
+| LLM integration | Claude Code built-in | PromptingTools.jl (any model) |
+| Setup | Plugin or one command | Startup.jl config |
+
+**When to use Auton.jl**: You want LLM assistance while *you* work in the Julia REPL—context-aware suggestions, code generation, and iterative refinement with you in control.
+
+**When to use AgentEval**: You want Claude Code to execute Julia code autonomously as part of a larger AI agent workflow, without requiring human presence at the REPL.
 
 ### vs ClaudeCodeSDK.jl
 
@@ -232,6 +323,35 @@ AgentEval.start_server(project_dir="/path/to/your/project")
 **When to use DaemonMode.jl**: For general script acceleration (if using older Julia).
 
 **When to use AgentEval**: For AI agent integration with modern Julia.
+
+## Claude Code Plugin
+
+The `claude-plugin/` directory contains a ready-to-use Claude Code plugin that provides:
+
+### Auto-configured MCP Server
+No need to manually run `claude mcp add`. The plugin configures the Julia MCP server automatically.
+
+### Slash Commands
+| Command | Description |
+|---------|-------------|
+| `/julia-reset` | Kill and respawn the Julia worker (hard reset) |
+| `/julia-info` | Show session information |
+| `/julia-pkg <action> [packages]` | Package management |
+| `/julia-activate <path>` | Activate a project/environment |
+
+### Best Practices Skill
+The included skill teaches Claude:
+- Always display code before calling `julia_eval` (for readable permission prompts)
+- First-time environment setup dialogue
+- When to use hard reset vs. continuing
+- Error handling patterns
+
+### Installation
+```bash
+claude --plugin-dir /path/to/AgentEval.jl/claude-plugin
+```
+
+See [claude-plugin/README.md](claude-plugin/README.md) for details.
 
 ## Security
 
