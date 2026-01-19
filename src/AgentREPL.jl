@@ -203,17 +203,31 @@ function ensure_tmux_repl!(; open_terminal::Bool=true)
         return false
     end
 
-    # Check if session already exists and is running Julia
-    if TMUX_REPL.active
-        try
-            run(pipeline(`tmux has-session -t $(TMUX_REPL.session_name)`, devnull))
-            return true
+    # Check if session already exists (whether we think it's active or not)
+    session_exists = try
+        run(pipeline(`tmux has-session -t $(TMUX_REPL.session_name)`, devnull))
+        true
+    catch
+        false
+    end
+
+    # If session exists and has Julia running, reconnect to it
+    if session_exists
+        # Verify Julia is running by checking for the julia> prompt
+        pane_content = try
+            read(`tmux capture-pane -t $(TMUX_REPL.session_name) -p`, String)
         catch
-            TMUX_REPL.active = false
+            ""
+        end
+
+        if contains(pane_content, "julia>")
+            TMUX_REPL.active = true
+            @info "Reconnected to existing Julia REPL in tmux session '$(TMUX_REPL.session_name)'"
+            return true
         end
     end
 
-    # Kill any existing session with our name
+    # Kill any existing session with our name (it's stale or not running Julia)
     try
         run(ignorestatus(pipeline(`tmux kill-session -t $(TMUX_REPL.session_name)`, devnull)))
     catch

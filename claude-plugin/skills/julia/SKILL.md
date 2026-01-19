@@ -42,21 +42,40 @@ Both modes support **type redefinition** after reset.
 | `activate` | Switch active project/environment |
 | `log_viewer` | Open a terminal window showing Julia output in real-time (distributed mode only) |
 
-## Critical: Show Code Before Evaluation
+## Critical: Beautiful Code and Output Display
 
-**Always display code in a readable format before calling `eval`.** The MCP permission prompt shows code as an escaped string which is difficult for users to read and verify.
+**The goal is to make Julia work feel like an interactive REPL session.**
 
-Correct workflow:
+### Before Evaluation: Show the Code
+
+Always display code in a readable format **before** calling `eval`. The MCP permission prompt shows code as an escaped string which is difficult to read.
 
 ```
 Running this Julia code:
 ```julia
-x = [1, 2, 3, 4, 5]
-mean(x)
+A = [1 2 3; 4 5 6; 7 8 9]
+det(A)
 ```
 
-[then call eval with the code]
+[then call eval]
 ```
+
+### After Evaluation: Format Results Beautifully
+
+Present results in REPL-style with proper formatting:
+
+```julia
+julia> A = [1 2 3; 4 5 6; 7 8 9]
+3×3 Matrix{Int64}:
+ 1  2  3
+ 4  5  6
+ 7  8  9
+
+julia> det(A)
+0.0
+```
+
+This workflow gives users the best of both worlds: they can verify code before it runs, and see results in a beautiful, readable format afterward.
 
 ## Understanding TTFX (Time to First X)
 
@@ -242,12 +261,45 @@ end
 [fibonacci(i) for i in 1:10]
 ```
 
+## Formatting Results Beautifully
+
+**CRITICAL: Always format Julia results in a readable REPL-style code block.**
+
+After calling `eval`, present the results to the user in a nicely formatted way that mimics the Julia REPL experience. This is especially important for:
+- Matrices and arrays (show the full formatted output)
+- DataFrames and tables
+- Custom types with pretty-printing
+- Multi-line output
+
+**Example - Good formatting:**
+
+```julia
+julia> A = [1 3 4; 4 5 6; 2 0 3]
+3×3 Matrix{Int64}:
+ 1  3  4
+ 4  5  6
+ 2  0  3
+
+julia> inv(A)
+3×3 Matrix{Float64}:
+ -0.6   0.36   0.08
+  0.0   0.2   -0.4
+  0.4  -0.24   0.28
+```
+
+**Example - Bad formatting (don't do this):**
+
+> The result is `[1 3 4; 4 5 6; 2 0 3]` and the inverse is `[-0.6 0.36 0.08; 0.0 0.2 -0.4; 0.4 -0.24 0.28]`
+
+The REPL-style formatting:
+- Shows the `julia>` prompt with the command
+- Preserves matrix/array alignment and spacing
+- Makes numerical results easy to read and verify
+- Feels like an interactive Julia session
+
 ## Output Capture
 
-Both return values and printed output are captured. Results are shown in this order for better visibility:
-1. **Result** (or Error) - shown first for collapsed view
-2. **Output** - any printed text
-3. **Code** - the executed code (user already saw it before approving)
+Both return values and printed output are captured from the `eval` tool. Format them beautifully as shown above.
 
 ## When NOT to Use These Tools
 
