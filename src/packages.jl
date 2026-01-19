@@ -108,8 +108,9 @@ function run_pkg_action_on_worker(action::String, pkg_list::Vector{String})
                 stdout_content = String(read(rd_out))
                 stderr_content = String(read(rd_err))
             finally
-                close(rd_out)
-                close(rd_err)
+                # Wrap each close in try-catch to prevent masking errors
+                try; close(rd_out); catch; end
+                try; close(rd_err); catch; end
             end
 
             (error = err, stdout = stdout_content, stderr = stderr_content)

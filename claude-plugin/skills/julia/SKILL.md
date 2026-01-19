@@ -1,7 +1,7 @@
 ---
 name: julia-evaluation
 description: This skill should be used when the user asks to "run Julia code", "evaluate Julia", "use Julia", mentions "persistent Julia session", "TTFX", or wants to work with Julia for data analysis, scientific computing, or package development. Provides best practices for using the Julia REPL MCP tools effectively.
-version: 0.3.0
+version: 0.5.0
 ---
 
 # Julia Development Best Practices
@@ -27,18 +27,9 @@ log_viewer(mode="auto")   # Opens a terminal with live output
 
 Or set `JULIA_REPL_VIEWER=auto` environment variable before starting.
 
-### Tmux Mode (DEPRECATED)
+### Note on Tmux Mode
 
-**Warning:** Tmux mode is deprecated and disabled by default.
-
-The tmux bidirectional REPL has unfixable marker pollution issues - the completion detection marker is always visible in the terminal output.
-
-**Use distributed mode with log viewer instead** for visual output.
-
-To force-enable tmux (not recommended):
-- Set `JULIA_REPL_ENABLE_TMUX=true` environment variable
-
-Both modes support **type redefinition** after reset.
+Tmux mode is deprecated due to unfixable marker pollution issues. Use distributed mode (default) with `log_viewer` for visual output.
 
 ## Available Tools
 
@@ -49,8 +40,8 @@ Both modes support **type redefinition** after reset.
 | `info` | Get session info (version, project, variables, worker ID) |
 | `pkg` | Manage packages (add, rm, status, update, instantiate, resolve, test, develop, free) |
 | `activate` | Switch active project/environment |
-| `log_viewer` | Open a terminal window showing Julia output in real-time (distributed mode only) |
-| `mode` | **Switch modes at runtime** - toggle between distributed and tmux without restart |
+| `log_viewer` | Open a terminal window showing Julia output in real-time |
+| `mode` | (Deprecated) Switch between distributed and tmux modes |
 
 ## Critical: Beautiful Code and Output Display
 

@@ -24,6 +24,7 @@ function ensure_worker!()
                 remotecall_fetch(Core.eval, WORKER.worker_id, Main, :(Pkg.activate($path)))
             catch e
                 @warn "Failed to activate project on worker" project=WORKER.project_path error=e
+                WORKER.project_path = nothing  # Clear invalid path to prevent repeated failures
             end
         end
     end
@@ -93,8 +94,9 @@ function capture_eval_on_worker(code::String)
                 stdout_content = String(read(rd_out))
                 stderr_content = String(read(rd_err))
             finally
-                close(rd_out)
-                close(rd_err)
+                # Wrap each close in try-catch to prevent masking errors
+                try; close(rd_out); catch; end
+                try; close(rd_err); catch; end
             end
 
             combined_output = stdout_content

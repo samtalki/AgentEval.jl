@@ -278,17 +278,6 @@ log_viewer(mode="off")
 
 Useful for seeing printed output as it happens, especially for long-running computations.
 
-### `mode` (Deprecated)
-
-Switch between execution modes at runtime. **Not recommended** - tmux mode has unfixable issues.
-
-```
-mode(mode="distributed")   # Default, recommended
-mode(mode="tmux")          # Deprecated - use log_viewer instead
-```
-
-Use distributed mode with `log_viewer` for visual output.
-
 ## Configuration
 
 ### Environment/Project Management
